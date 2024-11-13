@@ -6,7 +6,7 @@ import torch.optim as optim
 import math
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer
-from datasets import load_from_disk
+from datasets import load_from_disk, load_dataset
 from torch.nn.utils.rnn import pad_sequence
 from torch.cuda.amp import autocast, GradScaler
 
@@ -21,6 +21,9 @@ nltk.download('punkt')
 # 1. Disable tokenizer parallelism to prevent deadlocks
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+# Disable multithreading for home computers
+torch.set_num_threads(1)
+
 # 2. Device configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
@@ -33,6 +36,8 @@ train_dataset_path = "data/jfleg_train"
 validation_dataset_path = "data/jfleg_validation"
 
 # 5. Load the datasets from disk (can load from internet- but very slow on clusters: https://huggingface.co/docs/datasets/en/index)
+
+"""
 try:
     ds_train = load_from_disk(train_dataset_path)
     ds_validation = load_from_disk(validation_dataset_path)
@@ -40,6 +45,19 @@ try:
 except Exception as e:
     print(f"Error loading datasets: {e}")
     exit(1)
+"""
+
+
+try:
+    path = "" #set your own path
+    ds_train = load_dataset("parquet", data_files= path + "/jfleg/train.parquet")
+    ds_validation = load_dataset("parquet", data_files= path + "/jfleg/test.parquet")
+    print("Datasets loaded successfully.")
+except Exception as e:
+    print(f"Error loading datasets: {e}")
+    exit(1)
+
+
 
 # 6. Initialize tokenizer with special tokens (sos -> start of sentence, etc.)
 tokenizer = AutoTokenizer.from_pretrained("gpt2") # should we create our own? BPE?
@@ -67,7 +85,22 @@ class GrammarDataset(Dataset):
     def __init__(self, dataset):
         self.src_data = []
         self.tgt_data = []
-        for item in dataset:
+
+        #for datasets that have 1 to 1 sentences to corrections
+        """
+        for i in range(len(dataset["src"])):
+            incorrect_sentence = dataset['src'][i]['text']
+            correct_sentence = dataset['tgt'][i]['text']
+
+            src_tokens = tokenizer.encode(incorrect_sentence, add_special_tokens=True)
+            tgt_tokens = tokenizer.encode(correct_sentence, add_special_tokens=True)
+
+            if len(src_tokens) >= 2 and len(tgt_tokens) >= 2:
+                self.src_data.append(torch.tensor(src_tokens, dtype=torch.long))
+                self.tgt_data.append(torch.tensor(tgt_tokens, dtype=torch.long))
+
+        """
+        for item in dataset["train"]:
             incorrect_sentence = item['sentence']
             for correct_sentence in item['corrections']:
                 # Tokenize and encode the sentences
@@ -78,6 +111,7 @@ class GrammarDataset(Dataset):
                 if len(src_tokens) >= 2 and len(tgt_tokens) >= 2:
                     self.src_data.append(torch.tensor(src_tokens, dtype=torch.long))
                     self.tgt_data.append(torch.tensor(tgt_tokens, dtype=torch.long))
+   
 
     def __len__(self):
         return len(self.src_data)
@@ -93,7 +127,8 @@ def collate_fn(batch):
     return src_padded, tgt_padded
 
 # 11. Create DataLoaders with optimized settings
-batch_size = 128
+#batch_size = 128
+batch_size = 32
 dataloader_train = DataLoader(
     GrammarDataset(ds_train),
     batch_size=batch_size,
@@ -321,13 +356,8 @@ print("Model weights initialized.")
 # 22. Define training parameters
 start_lr = 1e-3       # Starting learning rate  # makeshift lr scheduler 😂
 end_lr = 1e-5         # Ending learning rate    # makeshift lr scheduler 😂
-num_lrs = 25          # Number of learning rates
-epochs_per_lr = 50    # Number of epochs per learning rate
-
-# 23. Define loss function
-criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
-
-epochs_per_lr = 50 # 50    # Number of epochs per learning rate
+num_lrs = 1          # Number of learning rates
+epochs_per_lr = 1    # Number of epochs per learning rate
 
 # 23. Define loss function
 criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
@@ -336,15 +366,21 @@ criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
 def correct_sentence(model, sentence, max_len=50):
     model.eval()
     src_tokens = tokenizer.encode(sentence, add_special_tokens=True)
+    #print(src_tokens)
     src_tensor = torch.tensor([src_tokens], dtype=torch.long).to(device)
     src_mask, _ = model.make_masks(src_tensor, None)  # Only compute src_mask
     e_outputs = model.encoder(src_tensor, src_mask)
     outputs = torch.tensor([[tokenizer.bos_token_id]], dtype=torch.long).to(device)
+
+    #print(outputs)
+    #print(tokenizer.eos_token_id)
+    #print(tokenizer.eos_token)
     for _ in range(max_len):
         _, tgt_mask = model.make_masks(None, outputs)  # Only compute tgt_mask
         d_output = model.decoder(outputs, e_outputs, src_mask, tgt_mask)
         out = model.out(d_output)
         token = out[:, -1, :].argmax(dim=-1)
+        #print(token.item())
         outputs = torch.cat([outputs, token.unsqueeze(1)], dim=1)
         if token.item() == tokenizer.eos_token_id:
             break
@@ -361,48 +397,50 @@ for lr_idx, lr in enumerate(np.linspace(start_lr, end_lr, num_lrs), 1):
     print(f"Optimizer initialized with learning rate: {lr:.6f}")
 
     # Initialize GradScaler for mixed precision
-    scaler = GradScaler()
+    scaler = torch.amp.GradScaler('cuda')
 
     for epoch in range(1, epochs_per_lr + 1):
         model.train()
         total_loss = 0
         total_correct = 0
         total_tokens = 0
-        for batch_idx, (src, tgt) in enumerate(dataloader_train, 1):
-            src, tgt = src.to(device, non_blocking=True), tgt.to(device, non_blocking=True)
-            optimizer.zero_grad()
 
-            with autocast():
-                output = model(src, tgt[:, :-1])  # Shifted right
-                output = output.reshape(-1, output.size(-1))
-                tgt_out = tgt[:, 1:].reshape(-1)
-                loss = criterion(output, tgt_out)
+        if __name__ == "__main__":
+            for batch_idx, (src, tgt) in enumerate(dataloader_train, 1):
+                src, tgt = src.to(device, non_blocking=True), tgt.to(device, non_blocking=True)
+                optimizer.zero_grad()
 
-            # Check for NaNs or Infs in loss
-            if torch.isnan(loss) or torch.isinf(loss): # if this occurs, lr is probably too high
-                print("Loss is NaN or Inf. Skipping this batch.")
-                continue  # Skip this batch # lr is probably too high
+                with torch.amp.autocast('cuda'):
+                    output = model(src, tgt[:, :-1])  # Shifted right
+                    output = output.reshape(-1, output.size(-1))
+                    tgt_out = tgt[:, 1:].reshape(-1)
+                    loss = criterion(output, tgt_out)
 
-            # Backward pass with mixed precision
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Gradient clipping
-            scaler.step(optimizer)
-            scaler.update()
-            total_loss += loss.item()
+                # Check for NaNs or Infs in loss
+                if torch.isnan(loss) or torch.isinf(loss): # if this occurs, lr is probably too high
+                    print("Loss is NaN or Inf. Skipping this batch.")
+                    continue  # Skip this batch # lr is probably too high
 
-            # Calculate accuracy
-            predicted_tokens = output.argmax(dim=1)
-            mask = tgt_out != tokenizer.pad_token_id
+                # Backward pass with mixed precision
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Gradient clipping
+                scaler.step(optimizer)
+                scaler.update()
+                total_loss += loss.item()
 
-            # Check if mask sum is zero
-            if mask.sum().item() == 0:
-                print(f"Batch {batch_idx}: All tokens are padding tokens in tgt_out. Skipping accuracy calculation.")
-                continue  # Skip this batch
+                # Calculate accuracy
+                predicted_tokens = output.argmax(dim=1)
+                mask = tgt_out != tokenizer.pad_token_id
 
-            correct = (predicted_tokens == tgt_out) & mask
-            total_correct += correct.sum().item()
-            total_tokens += mask.sum().item()
+                # Check if mask sum is zero
+                if mask.sum().item() == 0:
+                    print(f"Batch {batch_idx}: All tokens are padding tokens in tgt_out. Skipping accuracy calculation.")
+                    continue  # Skip this batch
+
+                correct = (predicted_tokens == tgt_out) & mask
+                total_correct += correct.sum().item()
+                total_tokens += mask.sum().item()
 
         # Calculate average loss and accuracy for the epoch
         avg_loss = total_loss / len(dataloader_train)
@@ -426,54 +464,55 @@ for lr_idx, lr in enumerate(np.linspace(start_lr, end_lr, num_lrs), 1):
     num_sentences = 0
     smoothie = SmoothingFunction().method4  # For BLEU score smoothing # this is used for grammar correction? Source: ChatGPT
     with torch.no_grad():
-        for batch_idx, (src, tgt) in enumerate(dataloader_validation, 1):
-            src, tgt = src.to(device, non_blocking=True), tgt.to(device, non_blocking=True)
-            with autocast():
-                output = model(src, tgt[:, :-1])
-                output = output.reshape(-1, output.size(-1))
-                tgt_out = tgt[:, 1:].reshape(-1)
-                loss = criterion(output, tgt_out)
-            val_loss += loss.item()
+        if __name__ == "__main__":
+            for batch_idx, (src, tgt) in enumerate(dataloader_validation, 1):
+                src, tgt = src.to(device, non_blocking=True), tgt.to(device, non_blocking=True)
+                with torch.amp.autocast("cuda"):
+                    output = model(src, tgt[:, :-1])
+                    output = output.reshape(-1, output.size(-1))
+                    tgt_out = tgt[:, 1:].reshape(-1)
+                    loss = criterion(output, tgt_out)
+                val_loss += loss.item()
 
-            # Calculate accuracy
-            predicted_tokens = output.argmax(dim=1)
-            mask = tgt_out != tokenizer.pad_token_id
+                # Calculate accuracy
+                predicted_tokens = output.argmax(dim=1)
+                mask = tgt_out != tokenizer.pad_token_id
 
-            if mask.sum().item() == 0:
-                print(f"Validation Batch {batch_idx}: All tokens are padding tokens in tgt_out. Skipping accuracy calculation.")
-                continue  # Skip this batch
+                if mask.sum().item() == 0:
+                    print(f"Validation Batch {batch_idx}: All tokens are padding tokens in tgt_out. Skipping accuracy calculation.")
+                    continue  # Skip this batch
 
-            correct = (predicted_tokens == tgt_out) & mask
-            val_correct += correct.sum().item()
-            val_total_tokens += mask.sum().item()
+                correct = (predicted_tokens == tgt_out) & mask
+                val_correct += correct.sum().item()
+                val_total_tokens += mask.sum().item()
 
-            # Compute BLEU score for each sentence in the batch
-            batch_size_val = src.size(0)
-            seq_len = tgt.size(1) - 1  # Exclude the start token
-            predicted_tokens = predicted_tokens.view(batch_size_val, seq_len)
-            tgt_out = tgt_out.view(batch_size_val, seq_len)
+                # Compute BLEU score for each sentence in the batch
+                batch_size_val = src.size(0)
+                seq_len = tgt.size(1) - 1  # Exclude the start token
+                predicted_tokens = predicted_tokens.view(batch_size_val, seq_len)
+                tgt_out = tgt_out.view(batch_size_val, seq_len)
 
-            for i in range(batch_size_val):
-                # Extract non-padded tokens
-                mask_i = mask.view(batch_size_val, seq_len)[i]
-                if mask_i.sum().item() == 0:
-                    continue  # Skip if all tokens are padding
+                for i in range(batch_size_val):
+                    # Extract non-padded tokens
+                    mask_i = mask.view(batch_size_val, seq_len)[i]
+                    if mask_i.sum().item() == 0:
+                        continue  # Skip if all tokens are padding
 
-                pred_tokens = predicted_tokens[i][mask_i].tolist()
-                tgt_tokens = tgt_out[i][mask_i].tolist()
+                    pred_tokens = predicted_tokens[i][mask_i].tolist()
+                    tgt_tokens = tgt_out[i][mask_i].tolist()
 
-                # Convert token IDs to sentences
-                pred_sentence = tokenizer.decode(pred_tokens, skip_special_tokens=True)
-                tgt_sentence = tokenizer.decode(tgt_tokens, skip_special_tokens=True)
+                    # Convert token IDs to sentences
+                    pred_sentence = tokenizer.decode(pred_tokens, skip_special_tokens=True)
+                    tgt_sentence = tokenizer.decode(tgt_tokens, skip_special_tokens=True)
 
-                # Tokenize sentences into words
-                reference = [nltk.word_tokenize(tgt_sentence)]
-                hypothesis = nltk.word_tokenize(pred_sentence)
+                    # Tokenize sentences into words
+                    reference = [nltk.word_tokenize(tgt_sentence)]
+                    hypothesis = nltk.word_tokenize(pred_sentence)
 
-                # Compute BLEU score with smoothing
-                bleu_score = sentence_bleu(reference, hypothesis, smoothing_function=smoothie)
-                total_bleu_score += bleu_score
-                num_sentences += 1
+                    # Compute BLEU score with smoothing
+                    bleu_score = sentence_bleu(reference, hypothesis, smoothing_function=smoothie)
+                    total_bleu_score += bleu_score
+                    num_sentences += 1
 
     # Calculate average validation loss, accuracy, and BLEU score
     avg_val_loss = val_loss / len(dataloader_validation)

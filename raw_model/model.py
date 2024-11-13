@@ -176,8 +176,9 @@ class Transformer(nn.Module):
         d_output = self.decoder(tgt, e_outputs, src_mask, tgt_mask)
         output = self.out(d_output)
         return output
-    ```
 
+
+"""
 **Key Changes:**
 
 - **Initialization Parameter:** Added `pad_token_id` as a parameter to the `Transformer` class and stored it as `self.pad_token_id`.
@@ -192,6 +193,8 @@ Now, update your `inference.py` (or `infer.py`) script to pass the `pad_token_id
 **Updated `inference.py`:**
 
 ```python
+
+"""
 # inference.py
 
 import torch
